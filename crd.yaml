@@ -1,0 +1,247 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: trinoclusters.dbqp.dev
+spec:
+  group: dbqp.dev
+  scope: Namespaced
+  names:
+    kind: TrinoCluster
+    plural: trinoclusters
+    shortNames:
+      - trino
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - coordinators
+                - workers
+                - image
+              properties:
+                coordinators:
+                  type: integer
+                  minimum: 1
+                  description: Number of coordinator nodes
+                workers:
+                  type: integer
+                  minimum: 1
+                  description: Number of worker nodes
+                image:
+                  type: string
+                  default: "trinodb/trino:latest"
+                  description: Container image for Trino
+                coordinatorResources:
+                  type: object
+                  properties:
+                    requests:
+                      type: object
+                      properties:
+                        memory:
+                          type: string
+                          default: "8Gi"
+                        cpu:
+                          type: string
+                          default: "4"
+                    limits:
+                      type: object
+                      properties:
+                        memory:
+                          type: string
+                          default: "16Gi"
+                        cpu:
+                          type: string
+                          default: "8"
+                workerResources:
+                  type: object
+                  properties:
+                    requests:
+                      type: object
+                      properties:
+                        memory:
+                          type: string
+                          default: "8Gi"
+                        cpu:
+                          type: string
+                          default: "4"
+                    limits:
+                      type: object
+                      properties:
+                        memory:
+                          type: string
+                          default: "16Gi"
+                        cpu:
+                          type: string
+                          default: "8"
+                storageBucket:
+                  type: string
+                  description: S3/MinIO bucket for data storage
+                metastoreHost:
+                  type: string
+                  default: "hive-metastore"
+                  description: Hive Metastore hostname
+                autoscaling:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    minWorkers:
+                      type: integer
+                      default: 1
+                    maxWorkers:
+                      type: integer
+                      default: 10
+                    targetCPU:
+                      type: integer
+                      default: 70
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - Creating
+                    - Running
+                    - Scaling
+                    - Failed
+                readyWorkers:
+                  type: integer
+                totalWorkers:
+                  type: integer
+                readyCoordinators:
+                  type: integer
+                totalCoordinators:
+                  type: integer
+                lastUpdateTime:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sparkclusters.dbqp.dev
+spec:
+  group: dbqp.dev
+  scope: Namespaced
+  names:
+    kind: SparkCluster
+    plural: sparkclusters
+    shortNames:
+      - spark
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - master
+                - workers
+                - image
+              properties:
+                master:
+                  type: integer
+                  minimum: 1
+                  default: 1
+                  description: Number of master nodes (typically 1)
+                workers:
+                  type: integer
+                  minimum: 1
+                  description: Number of worker nodes
+                image:
+                  type: string
+                  default: "bitnami/spark:latest"
+                  description: Container image for Spark
+                masterResources:
+                  type: object
+                  properties:
+                    requests:
+                      type: object
+                      properties:
+                        memory:
+                          type: string
+                          default: "4Gi"
+                        cpu:
+                          type: string
+                          default: "2"
+                workerResources:
+                  type: object
+                  properties:
+                    requests:
+                      type: object
+                      properties:
+                        memory:
+                          type: string
+                          default: "8Gi"
+                        cpu:
+                          type: string
+                          default: "4"
+                storageBucket:
+                  type: string
+                  description: S3/MinIO bucket for data storage
+                sparkConfig:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Spark configuration properties
+                autoscaling:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    minWorkers:
+                      type: integer
+                      default: 2
+                    maxWorkers:
+                      type: integer
+                      default: 10
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - Creating
+                    - Running
+                    - Scaling
+                    - Failed
+                readyWorkers:
+                  type: integer
+                totalWorkers:
+                  type: integer
+                masterReady:
+                  type: boolean
+                lastUpdateTime:
+                  type: string
+                  format: date-time

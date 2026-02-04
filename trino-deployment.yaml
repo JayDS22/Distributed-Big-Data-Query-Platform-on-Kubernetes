@@ -1,0 +1,239 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-coordinator-config
+  namespace: default
+data:
+  config.properties: |
+    coordinator=true
+    node-scheduler.include-coordinator=false
+    discovery-server.enabled=true
+    discovery.uri=http://localhost:8080
+    query.max-memory=4GB
+    query.max-memory-per-node=1GB
+    query.max-total-memory-per-node=2GB
+    memory.heap-headroom-per-node=1GB
+    http-server.http.port=8080
+    task.max-worker-threads=32
+    task.min-drivers=4
+    exchange.http-client.max-connections-per-server=1000
+
+  jvm.config: |
+    -server
+    -Xmx8G
+    -XX:+UseG1GC
+    -XX:MaxGCPauseMillis=30000
+    -XX:InitiatingHeapOccupancyPercent=35
+    -XX:G1HeapRegionSize=16m
+
+  log.properties: |
+    io.trino=INFO
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino-coordinator
+  namespace: default
+  labels:
+    app: trino
+    component: coordinator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trino
+      component: coordinator
+  template:
+    metadata:
+      labels:
+        app: trino
+        component: coordinator
+    spec:
+      containers:
+      - name: trino
+        image: trinodb/trino:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: TRINO_HOME
+          value: /usr/lib/trino
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: access-key
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: secret-key
+        volumeMounts:
+        - name: config
+          mountPath: /etc/trino
+        - name: data
+          mountPath: /var/trino/data
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "4"
+          limits:
+            memory: "16Gi"
+            cpu: "8"
+        livenessProbe:
+          httpGet:
+            path: /ui/
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ui/
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: trino-coordinator-config
+      - name: data
+        emptyDir:
+          sizeLimit: 10Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trino-coordinator
+  namespace: default
+  labels:
+    app: trino
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  selector:
+    app: trino
+    component: coordinator
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trino-workers
+  namespace: default
+  labels:
+    app: trino
+    component: worker
+spec:
+  serviceName: trino-workers
+  replicas: 3
+  selector:
+    matchLabels:
+      app: trino
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: trino
+        component: worker
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - trino
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: trino
+        image: trinodb/trino:latest
+        env:
+        - name: TRINO_DISCOVERY_URI
+          value: http://trino-coordinator:8080
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: access-key
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: secret-key
+        volumeMounts:
+        - name: config
+          mountPath: /etc/trino
+        - name: data
+          mountPath: /var/trino/data
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "4"
+          limits:
+            memory: "16Gi"
+            cpu: "8"
+        livenessProbe:
+          httpGet:
+            path: /v1/taskmanager
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /v1/taskmanager
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: trino-coordinator-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: trino-workers-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: trino-workers
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
