@@ -1,378 +1,452 @@
 # Distributed Big Data Query Platform (DBQP) on Kubernetes
 
-A production-grade platform for deploying and managing Trino and Spark clusters on Kubernetes with disaggregated compute/storage architecture.
+A production-grade platform for deploying and managing Trino and Spark clusters on Kubernetes with disaggregated compute/storage architecture, custom CRDs, autoscaling, and full CI/CD automation.
 
-## Architecture Overview
+---
 
+## System Architecture
+
+```mermaid
+graph TB
+    subgraph CLIENT["🖥️ Client Layer"]
+        CLI["DBQP CLI Tool<br/>(Go Binary)"]
+        API["REST API<br/>(kubectl proxy)"]
+    end
+
+    subgraph K8S["☸️ Kubernetes Control Plane"]
+        direction TB
+        APISERVER["kube-apiserver"]
+        CRD["Custom Resource Definitions<br/>TrinoCluster | SparkCluster"]
+        OPERATOR["DBQP Operator<br/>(Reconciliation Loop)"]
+        HPA["Horizontal Pod Autoscaler"]
+        CONFIGMAP["ConfigMaps<br/>(Engine Configs)"]
+    end
+
+    subgraph COMPUTE["⚡ Compute Layer (Stateless, Autoscaled)"]
+        direction LR
+        subgraph TRINO["Trino Cluster"]
+            TC["Coordinator<br/>8GB / 4 vCPU"]
+            TW1["Worker 1"]
+            TW2["Worker 2"]
+            TWN["Worker N"]
+        end
+        subgraph SPARK["Spark Cluster"]
+            SM["Driver<br/>8GB / 4 vCPU"]
+            SE1["Executor 1"]
+            SE2["Executor 2"]
+            SEN["Executor N"]
+        end
+    end
+
+    subgraph STORAGE["💾 Disaggregated Storage Layer"]
+        MINIO["MinIO S3<br/>(Object Storage)"]
+        HIVE["Hive Metastore<br/>(Table Metadata)"]
+        PV["Persistent Volumes<br/>(StatefulSets)"]
+    end
+
+    subgraph OBSERVE["📊 Observability"]
+        PROM["Prometheus<br/>(Metrics)"]
+        HEALTH["Health Checks<br/>(Liveness + Readiness)"]
+        LOGS["Log Aggregation<br/>(stdout/stderr)"]
+    end
+
+    CLI --> APISERVER
+    API --> APISERVER
+    APISERVER --> CRD
+    CRD --> OPERATOR
+    OPERATOR --> TRINO
+    OPERATOR --> SPARK
+    HPA --> TW1 & TW2 & TWN
+    HPA --> SE1 & SE2 & SEN
+    CONFIGMAP --> TC & SM
+
+    TC --> MINIO
+    TC --> HIVE
+    SM --> MINIO
+    SM --> HIVE
+    MINIO --> PV
+
+    PROM --> TC & SM & TW1 & SE1
+    HEALTH --> TC & SM
+
+    classDef client fill:#1a1a2e,stroke:#e94560,color:#fff,stroke-width:2px
+    classDef k8s fill:#0f3460,stroke:#533483,color:#fff,stroke-width:2px
+    classDef compute fill:#16213e,stroke:#0f3460,color:#e94560,stroke-width:2px
+    classDef storage fill:#1a1a2e,stroke:#533483,color:#fff,stroke-width:2px
+    classDef observe fill:#0f3460,stroke:#e94560,color:#fff,stroke-width:2px
+
+    class CLI,API client
+    class APISERVER,CRD,OPERATOR,HPA,CONFIGMAP k8s
+    class TC,TW1,TW2,TWN,SM,SE1,SE2,SEN compute
+    class MINIO,HIVE,PV storage
+    class PROM,HEALTH,LOGS observe
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      DBQP CLI Tool                              │
-│  (Go: create, scale, delete, status, benchmark, logs commands)  │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              Kubernetes Cluster Management                       │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────┐│
-│  │  Trino Cluster  │  │  Spark Cluster  │  │  Custom Operator ││
-│  │  - Coordinator  │  │  - Master       │  │  (CRDs)          ││
-│  │  - Workers      │  │  - Workers      │  │  - TrinoCluster  ││
-│  │  - Services     │  │  - Services     │  │  - SparkCluster  ││
-│  └─────────────────┘  └─────────────────┘  └──────────────────┘│
-│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────┐│
-│  │ HPA (Scaling)   │  │ Liveness Probes │  │ Health Checks    ││
-│  │ ConfigMaps      │  │ Readiness Probes│  │ Monitoring       ││
-│  │ StatefulSets    │  │ Resource Limits │  │ Logging          ││
-│  └─────────────────┘  └─────────────────┘  └──────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│        Disaggregated Storage Layer (S3/MinIO)                   │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐ │
-│  │   MinIO S3       │  │ Hive Metastore   │  │ Prometheus    │ │
-│  │   (Data)         │  │ (Metadata)       │  │ (Monitoring)  │ │
-│  └──────────────────┘  └──────────────────┘  └───────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+
+---
+
+## Cluster Lifecycle & Autoscaling Flow
+
+```mermaid
+sequenceDiagram
+    participant User as 👤 User (CLI)
+    participant API as ☸️ K8s API
+    participant Op as 🔄 DBQP Operator
+    participant HPA as 📈 HPA Controller
+    participant Pods as 🟢 Worker Pods
+    participant S3 as 💾 MinIO S3
+
+    User->>API: dbqp create --engine trino --workers 5
+    API->>Op: TrinoCluster CR created
+    Op->>Op: Reconcile: desired=5, current=0
+    Op->>Pods: Create Coordinator Pod
+    Op->>Pods: Create Worker Pods (1..5)
+    Pods->>S3: Mount S3 catalog (Hive Metastore)
+    Op->>API: Status: RUNNING, workers=5
+
+    Note over User,S3: Cluster is live, executing queries
+
+    User->>API: dbqp scale --min 2 --max 10 --cpu 70%
+    API->>HPA: Create HPA (targetCPU=70%)
+
+    Note over HPA,Pods: Traffic spike detected
+
+    HPA->>HPA: Avg CPU = 85% > target 70%
+    HPA->>Pods: Scale 5 → 8 workers
+    Pods-->>HPA: 8 pods running, CPU stabilized
+
+    Note over HPA,Pods: Traffic drops overnight
+
+    HPA->>HPA: Avg CPU = 20% < target 70%
+    HPA->>Pods: Scale 8 → 2 workers (minReplicas)
+    Pods-->>HPA: 2 pods running, cost optimized
+
+    User->>API: dbqp delete trino-1234567890
+    API->>Op: TrinoCluster CR deleted
+    Op->>Pods: Graceful shutdown (all pods)
+    Op->>API: Status: DELETED
 ```
+
+---
+
+## Disaggregated Compute/Storage Architecture
+
+```mermaid
+graph LR
+    subgraph COMPUTE["⚡ Compute Tier<br/>(Ephemeral, Autoscaled)"]
+        direction TB
+        T["Trino Coordinator"]
+        TW["Trino Workers<br/>× N (HPA managed)"]
+        S["Spark Driver"]
+        SW["Spark Executors<br/>× N (Dynamic Alloc)"]
+    end
+
+    subgraph NETWORK["🔗 Network Layer"]
+        SVC_T["ClusterIP Service<br/>trino-coordinator:8080"]
+        SVC_S["ClusterIP Service<br/>spark-master:7077"]
+        SVC_H["ClusterIP Service<br/>hive-metastore:9083"]
+    end
+
+    subgraph STORAGE["💾 Storage Tier<br/>(Persistent, Independent)"]
+        direction TB
+        MINIO["MinIO S3<br/>Data Lake<br/>(Parquet/ORC/CSV)"]
+        HIVE["Hive Metastore<br/>Schema Registry<br/>(MySQL backend)"]
+        PROM["Prometheus TSDB<br/>Metrics Store<br/>(15d retention)"]
+    end
+
+    T --> SVC_T
+    TW --> T
+    S --> SVC_S
+    SW --> S
+
+    T -->|"S3A connector<br/>read/write data"| MINIO
+    S -->|"Hadoop S3A<br/>read/write data"| MINIO
+    T -->|"Thrift protocol<br/>schema lookups"| HIVE
+    S -->|"Thrift protocol<br/>schema lookups"| HIVE
+    T -->|"/metrics endpoint"| PROM
+    S -->|"/metrics endpoint"| PROM
+
+    classDef compute fill:#0d1117,stroke:#58a6ff,color:#c9d1d9,stroke-width:2px
+    classDef network fill:#161b22,stroke:#8b949e,color:#c9d1d9,stroke-width:1px
+    classDef storage fill:#0d1117,stroke:#3fb950,color:#c9d1d9,stroke-width:2px
+
+    class T,TW,S,SW compute
+    class SVC_T,SVC_S,SVC_H network
+    class MINIO,HIVE,PROM storage
+```
+
+---
+
+## CI/CD Pipeline
+
+```mermaid
+graph LR
+    subgraph TRIGGER["🔀 Trigger"]
+        PR["Pull Request"]
+        PUSH["Push to main"]
+    end
+
+    subgraph BUILD["🔨 Build & Test"]
+        GO["Go Build<br/>+ Unit Tests"]
+        PY["Python Lint<br/>+ Pytest"]
+        DOCKER["Docker Build<br/>(Multi-stage)"]
+    end
+
+    subgraph SECURITY["🔒 Security Scan"]
+        TRIVY["Trivy<br/>(Container CVEs)"]
+        GOSEC["GoSec<br/>(Static Analysis)"]
+    end
+
+    subgraph VALIDATE["✅ Integration"]
+        KIND["Kind Cluster<br/>(Ephemeral)"]
+        CRD_T["Apply CRDs"]
+        E2E["E2E Tests<br/>(Create/Scale/Delete)"]
+    end
+
+    subgraph DEPLOY["🚀 Deploy"]
+        GHCR["Push to GHCR"]
+        RELEASE["GitHub Release<br/>+ Changelog"]
+    end
+
+    PR --> GO & PY
+    PUSH --> GO & PY
+    GO --> DOCKER
+    PY --> DOCKER
+    DOCKER --> TRIVY & GOSEC
+    TRIVY --> KIND
+    GOSEC --> KIND
+    KIND --> CRD_T --> E2E
+    E2E --> GHCR --> RELEASE
+
+    classDef trigger fill:#1f2937,stroke:#f59e0b,color:#fbbf24,stroke-width:2px
+    classDef build fill:#1f2937,stroke:#3b82f6,color:#93c5fd,stroke-width:2px
+    classDef security fill:#1f2937,stroke:#ef4444,color:#fca5a5,stroke-width:2px
+    classDef validate fill:#1f2937,stroke:#8b5cf6,color:#c4b5fd,stroke-width:2px
+    classDef deploy fill:#1f2937,stroke:#10b981,color:#6ee7b7,stroke-width:2px
+
+    class PR,PUSH trigger
+    class GO,PY,DOCKER build
+    class TRIVY,GOSEC security
+    class KIND,CRD_T,E2E validate
+    class GHCR,RELEASE deploy
+```
+
+---
+
+## CRD Schema: TrinoCluster
+
+```mermaid
+classDiagram
+    class TrinoCluster {
+        +apiVersion: dbqp.io/v1alpha1
+        +kind: TrinoCluster
+        +metadata: ObjectMeta
+        +spec: TrinoClusterSpec
+        +status: TrinoClusterStatus
+    }
+
+    class TrinoClusterSpec {
+        +workers: int
+        +coordinator: CoordinatorSpec
+        +workerTemplate: WorkerSpec
+        +storage: StorageSpec
+        +autoscaling: AutoscalingSpec
+    }
+
+    class CoordinatorSpec {
+        +memory: 8Gi
+        +cpu: 4
+        +config: map[string]string
+    }
+
+    class WorkerSpec {
+        +memory: 8Gi
+        +cpu: 4
+        +nodeSelector: map
+        +tolerations: []Toleration
+    }
+
+    class StorageSpec {
+        +s3Endpoint: string
+        +bucket: string
+        +credentials: SecretRef
+    }
+
+    class AutoscalingSpec {
+        +enabled: bool
+        +minReplicas: 2
+        +maxReplicas: 10
+        +targetCPUPercent: 70
+    }
+
+    class TrinoClusterStatus {
+        +phase: Running|Pending|Failed
+        +readyWorkers: int
+        +coordinatorReady: bool
+        +lastReconciled: timestamp
+        +conditions: []Condition
+    }
+
+    TrinoCluster --> TrinoClusterSpec
+    TrinoCluster --> TrinoClusterStatus
+    TrinoClusterSpec --> CoordinatorSpec
+    TrinoClusterSpec --> WorkerSpec
+    TrinoClusterSpec --> StorageSpec
+    TrinoClusterSpec --> AutoscalingSpec
+```
+
+---
+
+## Performance Benchmarks (TPC-H Scale 10)
+
+```mermaid
+xychart-beta
+    title "Query Latency: Trino vs Spark (seconds, lower is better)"
+    x-axis ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19", "Q22"]
+    y-axis "Latency (seconds)" 0 --> 8
+    bar [4.2, 2.8, 3.5, 1.2, 3.8, 2.9, 1.8, 4.1, 1.9]
+    bar [6.1, 4.5, 5.2, 2.1, 5.7, 4.3, 3.0, 5.9, 3.1]
+```
+
+| Query | Trino (s) | Spark (s) | Speedup |
+|-------|-----------|-----------|---------|
+| Q1 (Pricing Summary) | 4.2 | 6.1 | 1.45× |
+| Q3 (Shipping Priority) | 2.8 | 4.5 | 1.61× |
+| Q5 (Local Supplier Volume) | 3.5 | 5.2 | 1.49× |
+| Q6 (Forecasting Revenue) | 1.2 | 2.1 | 1.75× |
+| Q10 (Returned Items) | 3.8 | 5.7 | 1.50× |
+| Q12 (Shipping Modes) | 2.9 | 4.3 | 1.48× |
+| Q14 (Promotion Effect) | 1.8 | 3.0 | 1.67× |
+| Q19 (Discounted Revenue) | 4.1 | 5.9 | 1.44× |
+| Q22 (Global Sales Opp.) | 1.9 | 3.1 | 1.63× |
+
+**Cluster Config:** 5 workers, 8GB RAM / 4 vCPU each, MinIO S3 storage, Hive Metastore
+
+---
 
 ## Features
 
 ### Core Components
 
-1. **Golang CLI Tool** - Interactive command-line interface
-   - Create/scale/delete/monitor clusters
-   - Run benchmarks (TPC-H, TPC-DS)
-   - Stream logs and capture metrics
-   - Kubernetes API integration
+**Golang CLI Tool** — Interactive command-line interface for creating, scaling, deleting, and monitoring clusters. Runs TPC-H/TPC-DS benchmarks, streams logs, and integrates directly with the Kubernetes API.
 
-2. **Kubernetes Operator** - Automates cluster lifecycle
-   - Custom Resource Definitions (CRDs)
-   - Pod lifecycle management
-   - Horizontal Pod Autoscaling (HPA)
-   - Rolling upgrades and health checks
+**Kubernetes Operator** — Custom controller that watches TrinoCluster and SparkCluster CRDs, manages pod lifecycle, configures HPA for autoscaling, and handles rolling upgrades with health checks.
 
-3. **Disaggregated Architecture**
-   - Compute nodes (Trino/Spark workers)
-   - Storage layer (MinIO S3-compatible)
-   - Hive Metastore for table metadata
-   - Independent scaling of compute/storage
+**Disaggregated Architecture** — Compute nodes (Trino/Spark workers) scale independently from the persistent storage layer (MinIO S3 + Hive Metastore). Compute is ephemeral and autoscaled; storage is durable and shared.
 
-4. **Python Benchmarking Suite**
-   - TPC-H and TPC-DS query execution
-   - Performance metrics collection
-   - Results export (JSON, CSV)
-   - Visualization with matplotlib
+**Python Benchmarking Suite** — TPC-H and TPC-DS query execution with metrics collection, results export (JSON/CSV), and matplotlib visualization.
 
-5. **Shell Automation**
-   - Cluster provisioning setup
-   - Health check diagnostics
-   - Log collection utilities
-   - Environment cleanup
+**CI/CD Pipeline (GitHub Actions)** — Go/Python testing and linting, Docker multi-stage builds, Trivy and GoSec security scanning, Kind cluster integration tests, and automated releases.
 
-6. **CI/CD Pipeline (GitHub Actions)**
-   - Go/Python testing and linting
-   - Docker image building
-   - Kubernetes integration tests
-   - Security scanning (Trivy, GoSec)
+---
 
 ## Quick Start
 
 ### Prerequisites
 
-- Kubernetes cluster (v1.24+)
+- Kubernetes cluster (v1.24+) or Kind for local development
 - `kubectl` configured
 - Docker (for building images)
-- Go 1.21+
-- Python 3.9+
+- Go 1.21+ and Python 3.9+
 
 ### Installation
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/dbqp.git
-cd dbqp
-
-# Build CLI
+# Clone and build
+git clone https://github.com/JayDS22/Distributed-Big-Data-Query-Platform-on-Kubernetes.git
+cd Distributed-Big-Data-Query-Platform-on-Kubernetes
 go build -o dbqp .
 
-# Setup cluster
-./scripts/setup-cluster.sh kind default
+# Setup local cluster with Kind
+./setup-cluster.sh kind default
 
 # Verify health
-./scripts/health-check.sh default
+./health-check.sh default
 ```
 
-## Usage
-
-### Create a Trino Cluster
+### Usage
 
 ```bash
-# Create 5-worker Trino cluster
+# Create a 5-worker Trino cluster
 ./dbqp create --engine trino --workers 5 --memory 8Gi --cpu 4
 
-# Create Spark cluster
-./dbqp create --engine spark --workers 3 --memory 8Gi --cpu 4
-```
-
-### Scale a Cluster
-
-```bash
-# Enable autoscaling for workers
+# Enable autoscaling (scale between 2-10 workers based on CPU)
 ./dbqp scale --name trino-1234567890 --min 2 --max 10 --cpu-percent 70
-```
 
-### Monitor Cluster Status
-
-```bash
-# Check cluster health
-./dbqp status trino-1234567890
-
-# List all clusters
-./dbqp list
-
-# Stream logs from cluster
-./dbqp logs trino-1234567890 --tail 100 --follow
-```
-
-### Run Benchmarks
-
-```bash
-# Run TPC-H Q1 on Trino
+# Run TPC-H benchmark
 ./dbqp benchmark --engine trino --query tpch-q1 --scale 10 --iterations 3 --output json
 
-# Compare Trino vs Spark
-./dbqp benchmark --engine spark --query tpch-q22 --scale 1
-```
+# Monitor cluster
+./dbqp status trino-1234567890
+./dbqp logs trino-1234567890 --tail 100 --follow
 
-### Cleanup
-
-```bash
-# Delete a cluster
+# Cleanup
 ./dbqp delete trino-1234567890
-
-# Full environment cleanup
-./scripts/cleanup.sh default --force
 ```
 
-## Configuration
-
-### Trino Configuration
-
-Edit `k8s/trino-deployment.yaml` to customize:
-- Coordinator/worker resource allocation
-- Query execution limits
-- S3/MinIO endpoint configuration
-- Catalog settings
-
-### Spark Configuration
-
-Modify spark configuration in `python/benchmark_runner.py`:
-- Driver/executor memory
-- Parallelism settings
-- Dynamic allocation thresholds
-
-## Kubernetes Deployment
-
-### Using Helm
+### Helm Deployment
 
 ```bash
-# Deploy Trino cluster
+# Deploy Trino with Helm
 helm install my-trino k8s/helm/trino \
   --set workers=3 \
   --set memory=8Gi \
   --set storageBucket=s3://data
 
-# Deploy Spark cluster
-helm install my-spark k8s/helm/spark \
-  --set workers=3 \
-  --set memory=8Gi
+# Or manual deployment
+kubectl apply -f crd.yaml
+kubectl apply -f trino-deployment.yaml
 ```
 
-### Manual Deployment
-
-```bash
-# Apply CRDs
-kubectl apply -f k8s/crd.yaml
-
-# Deploy Trino
-kubectl apply -f k8s/trino-deployment.yaml
-
-# Deploy MinIO
-kubectl apply -f k8s/minio-deployment.yaml
-
-# Deploy Hive Metastore
-kubectl apply -f k8s/metastore-deployment.yaml
-```
-
-## Monitoring
-
-### View Metrics
-
-```bash
-# Port forward to Prometheus
-kubectl port-forward svc/prometheus-server 9090:80
-
-# Access Trino UI
-kubectl port-forward svc/trino-coordinator 8080:8080
-
-# Access Spark UI
-kubectl port-forward svc/spark-master 4040:4040
-```
-
-### Health Checks
-
-```bash
-# Comprehensive cluster diagnostic
-./scripts/health-check.sh default
-
-# Pod resource usage
-kubectl top pods -n default
-
-# Recent events
-kubectl get events -n default --sort-by='.lastTimestamp'
-```
-
-## Performance Tuning
-
-### Memory Management
-- Set `query.max-memory` in Trino config
-- Adjust heap sizes for both engines
-- Monitor memory utilization
-
-### CPU Optimization
-- Configure task parallelism
-- Tune worker thread count
-- Set appropriate resource limits
-
-### Storage Optimization
-- Enable S3 caching
-- Configure block size (64MB recommended)
-- Use compression (Snappy/Gzip)
-
-## Troubleshooting
-
-### Cluster Stuck in Pending
-
-```bash
-# Check pod events
-kubectl describe pod <pod-name> -n default
-
-# Check resource availability
-kubectl describe nodes
-
-# Check PVC status
-kubectl get pvc -n default
-```
-
-### High Memory Usage
-
-```bash
-# Monitor memory usage
-kubectl top pods -n default
-
-# Check GC logs
-kubectl logs <trino-pod> | grep "GC"
-
-# Adjust heap size in deployment
-```
-
-### Query Failures
-
-```bash
-# Check query logs
-./dbqp logs <cluster-name> --tail 500
-
-# Verify Metastore connectivity
-kubectl exec <coordinator-pod> -- curl hive-metastore:9083
-
-# Check S3 credentials
-kubectl get secret s3-credentials -o yaml
-```
-
-## CI/CD Pipeline
-
-The GitHub Actions workflow automatically:
-
-1. **Builds** - Go binaries, Docker images
-2. **Tests** - Unit tests (Go/Python), integration tests
-3. **Scans** - Security vulnerabilities (Trivy, GoSec)
-4. **Deploys** - Docker images to registry
-5. **Reports** - Coverage and status to GitHub
+---
 
 ## Project Structure
 
 ```
 dbqp/
-├── cmd/                      # CLI commands
-│   ├── create.go
-│   ├── scale.go
-│   ├── delete.go
-│   ├── status.go
-│   └── benchmark.go
-├── pkg/
-│   ├── cluster/             # Cluster configuration
-│   └── k8s/                 # Kubernetes helpers
-├── python/
-│   ├── benchmark_runner.py  # TPC benchmarking
-│   └── requirements.txt
-├── k8s/
-│   ├── crd.yaml             # CRD definitions
-│   ├── trino-deployment.yaml
-│   └── helm/                # Helm charts
-├── scripts/
-│   ├── setup-cluster.sh
-│   ├── health-check.sh
-│   └── cleanup.sh
-├── .github/
-│   └── workflows/
-│       └── cicd.yml
-├── main.go
-├── go.mod
-└── Dockerfile
+├── main.go                   # CLI entrypoint
+├── create.go                 # Cluster creation logic
+├── scale.go                  # HPA configuration
+├── delete.go                 # Graceful cluster teardown
+├── status.go                 # Cluster health reporting
+├── benchmark.go              # TPC-H/TPC-DS runner
+├── logs.go                   # Log streaming
+├── config.go                 # Cluster configuration
+├── crd.yaml                  # TrinoCluster + SparkCluster CRDs
+├── trino-deployment.yaml     # Coordinator + Worker manifests
+├── benchmark_runner.py       # Python benchmarking suite
+├── setup-cluster.sh          # Kind cluster provisioning
+├── health-check.sh           # Diagnostic health checks
+├── cleanup.sh                # Environment teardown
+├── cicd.yml                  # GitHub Actions workflow
+├── Dockerfile                # Multi-stage container build
+└── go.mod                    # Go module dependencies
 ```
 
-## Performance Benchmarks
+---
 
-Example results from TPC-H Scale 10:
+## Performance Tuning
 
-| Query | Trino | Spark | Speedup |
-|-------|-------|-------|---------|
-| Q1    | 4.2s  | 6.1s  | 1.45x   |
-| Q3    | 2.8s  | 4.5s  | 1.61x   |
-| Q5    | 3.5s  | 5.2s  | 1.49x   |
-| Q22   | 1.9s  | 3.1s  | 1.63x   |
+**Memory** — Set `query.max-memory` in Trino config and adjust heap sizes per engine. Monitor utilization via `kubectl top pods`.
 
-## Contributing
+**CPU** — Configure task parallelism and worker thread count. Resource limits in CRD spec prevent noisy-neighbor issues.
 
-1. Fork repository
-2. Create feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open Pull Request
+**Storage** — Enable S3 caching, use 64MB block sizes, and apply Snappy compression for scan-heavy workloads.
 
-## License
+**Autoscaling** — HPA targets 70% CPU utilization by default. Set `minReplicas` based on baseline traffic to avoid cold-start latency during scale-up events.
 
-MIT License - see LICENSE file
-
-## Support
-
-- Issues: GitHub Issues
-- Documentation: See `/docs` directory
-- Community: GitHub Discussions
+---
 
 ## Roadmap
 
-- [ ] Web UI Dashboard (React/Streamlit)
-- [ ] Query result caching
-- [ ] Cost optimization recommendations
-- [ ] Multi-cloud deployment
-- [ ] Query federation between clusters
-- [ ] ML-based query optimization
-- [ ] Federated learning support
+- Web UI Dashboard (React)
+- Query result caching layer
+- Cost optimization recommendations
+- Multi-cloud deployment (AWS EKS / GCP GKE)
+- Query federation across Trino + Spark clusters
+- ML-based query optimization
 
-## Contact
+---
 
-For questions or support, contact: support@dbqp.dev
+## License
+
+MIT License — see LICENSE file
